@@ -1,5 +1,7 @@
 const express = require('express');
 const cors = require('cors');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 
@@ -9,6 +11,37 @@ app.use(cors({
   methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
+
+// ─── دالة قراءة وتحويل كوكيز Netscape إلى صيغة نصية يفهمها الـ Header ───
+function loadCookies() {
+  const cookiesPath = path.resolve(__dirname, 'cookies.txt');
+  if (!fs.existsSync(cookiesPath)) {
+    console.warn("[⚠️ WARNING] ملف cookies.txt غير موجود في المسار:", cookiesPath);
+    return '';
+  }
+
+  try {
+    const content = fs.readFileSync(cookiesPath, 'utf8');
+    const lines = content.split('\n');
+    const cookiePairs = [];
+
+    for (let line of lines) {
+      line = line.trim();
+      if (!line || line.startsWith('#')) continue;
+      const parts = line.split('\t');
+      if (parts.length >= 7) {
+        const name = parts[5];
+        const value = parts[6];
+        cookiePairs.push(`${name}=${value}`);
+      }
+    }
+    console.log(`[INFO] تم تحميل (${cookiePairs.length}) كوكيز بنجاح لتخطي القيود.`);
+    return cookiePairs.join('; ');
+  } catch (error) {
+    console.error("[❌ ERROR] فشل في قراءة ملف الكوكيز:", error.message);
+    return '';
+  }
+}
 
 // ─── استخراج JSON من HTML بعد بالعد اليدوي للأقواس (أثبت من regex) ───
 function extractJSONObject(html, key) {
@@ -65,11 +98,15 @@ function extractVideoId(input) {
 
 // ─── جلب الترجمة ───
 async function fetchTranscript(videoId) {
+  // تحميل الكوكيز ديناميكياً لتمريرها مع الطلب
+  const cookieString = loadCookies();
+
   const headers = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Language': 'ar,en-US;q=0.9,en;q=0.8',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
     'Accept-Encoding': 'gzip, deflate, br',
+    ...(cookieString ? { 'Cookie': cookieString } : {}) // إضافة الكوكيز فقط إذا كانت موجودة
   };
 
   const pageRes = await fetch(`https://www.youtube.com/watch?v=${videoId}`, { headers });
@@ -122,7 +159,7 @@ async function fetchTranscript(videoId) {
     // هل الفيديو ممتاز أو مقيّد؟
     const status = playerData?.playabilityStatus?.status;
     if (status === 'LOGIN_REQUIRED' || status === 'UNPLAYABLE') {
-      throw new Error('هذا الفيديو مقيّد أو يتطلب تسجيل دخول ولا يمكن استخراج ترجمته.');
+      throw new Error('هذا الفيديو مقيّد أو يتطلب تسجيل دخول ولا يمكن استخراج ترجمته آلياً.');
     }
     throw new Error('لا توجد ترجمة متاحة لهذا الفيديو.\nتأكد أن الفيديو يحتوي على ترجمة يدوية أو تلقائية.');
   }
@@ -175,7 +212,7 @@ app.get('/api/transcript', async (req, res) => {
     res.json(data);
   } catch (err) {
     console.error('[Error]', videoId, err.message);
-    const status = err.message.includes('لا توجد ترجمة') || err.message.includes('مقيّد') ? 404 : 500;
+    const status = err.message.includes('لا توجد ترجمة') ? 404 : (err.message.includes('مقيّد') || err.message.includes('تسجيل دخول') ? 403 : 500);
     res.status(status).json({ error: err.message });
   }
 });
