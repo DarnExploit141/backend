@@ -1,84 +1,135 @@
 const express = require('express');
 const cors = require('cors');
-const axios = require('axios');
 
 const app = express();
-
-// تفعيل الـ CORS للسماح لموقعك على GitHub Pages بالاتصال بالسيرفر بأمان
 app.use(cors());
 
+// ─── استخراج معرف الفيديو من الرابط ───
+function extractVideoId(url) {
+  const patterns = [
+    /[?&]v=([^&#]{11})/,
+    /youtu\.be\/([^?&#]{11})/,
+    /embed\/([^?&#]{11})/,
+    /shorts\/([^?&#]{11})/
+  ];
+  for (const p of patterns) {
+    const m = url.match(p);
+    if (m) return m[1];
+  }
+  return url.length === 11 ? url : null;
+}
+
+// ─── جلب الترجمة مباشرة عبر Innertube API (غير رسمي لكن أثبت) ───
+async function fetchTranscriptViaInnertube(videoId) {
+  // الخطوة 1: جلب صفحة الفيديو لاستخراج API key وبيانات الجلسة
+  const pageRes = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      'Accept-Language': 'ar,en-US;q=0.9,en;q=0.8',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    }
+  });
+
+  if (!pageRes.ok) throw new Error('تعذر الوصول إلى يوتيوب');
+  const html = await pageRes.text();
+
+  // استخراج عنوان الفيديو
+  let title = null;
+  const titleMatch = html.match(/<title>(.+?)<\/title>/);
+  if (titleMatch) title = titleMatch[1].replace(' - YouTube', '').trim();
+
+  // استخراج ytInitialPlayerResponse
+  const playerMatch = html.match(/ytInitialPlayerResponse\s*=\s*({.+?});(?:\s*var\s|\s*<\/script>)/);
+  if (!playerMatch) throw new Error('تعذر استخراج بيانات الفيديو من يوتيوب');
+
+  let playerData;
+  try {
+    playerData = JSON.parse(playerMatch[1]);
+  } catch (e) {
+    throw new Error('تعذر قراءة بيانات الفيديو');
+  }
+
+  // استخراج مسارات الترجمة
+  const captions = playerData?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+  if (!captions || captions.length === 0) {
+    throw new Error('لا توجد ترجمة متاحة لهذا الفيديو.\nتأكد أن الفيديو يحتوي على ترجمة يدوية أو تلقائية.');
+  }
+
+  // اختيار أفضل ترجمة: عربي → إنجليزي → أول واحد
+  const track =
+    captions.find(t => t.languageCode === 'ar') ||
+    captions.find(t => t.languageCode?.startsWith('ar')) ||
+    captions.find(t => t.languageCode === 'en') ||
+    captions.find(t => t.kind !== 'asr') ||
+    captions[0];
+
+  // جلب ملف XML للترجمة
+  const xmlRes = await fetch(track.baseUrl, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    }
+  });
+
+  if (!xmlRes.ok) throw new Error('فشل تحميل ملف الترجمة');
+  const xml = await xmlRes.text();
+
+  // استخراج النصوص من XML
+  let raw = '';
+  const regex = /<text[^>]*>([\s\S]*?)<\/text>/g;
+  let match;
+  while ((match = regex.exec(xml)) !== null) {
+    let t = match[1]
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&#39;/g, "'")
+      .replace(/&quot;/g, '"')
+      .replace(/&nbsp;/g, ' ')
+      .replace(/<[^>]+>/g, '')
+      .replace(/\[.*?\]/g, '')
+      .trim();
+    if (t) raw += t + ' ';
+  }
+
+  if (!raw.trim()) throw new Error('ملف الترجمة موجود ولكنه فارغ.');
+
+  return {
+    raw: raw.trim(),
+    title,
+    lang: track.languageCode || 'und',
+    langName: track.name?.simpleText || track.languageCode || '?'
+  };
+}
+
+// ─── Route الرئيسي ───
 app.get('/api/transcript', async (req, res) => {
-    const videoId = req.query.v;
-    if (!videoId) {
-        return res.status(400).json({ error: 'معرّف الفيديو (Video ID) مطلوب.' });
+  const input = req.query.v;
+  if (!input) {
+    return res.status(400).json({ error: 'معرّف الفيديو (Video ID) مطلوب.' });
+  }
+
+  const videoId = extractVideoId(input) || input;
+
+  try {
+    const data = await fetchTranscriptViaInnertube(videoId);
+    res.json(data);
+  } catch (error) {
+    console.error('[Transcript Error]', error.message);
+
+    const msg = error.message || 'خطأ غير معروف';
+
+    if (msg.includes('ترجمة')) {
+      return res.status(404).json({ error: msg });
     }
-
-    try {
-        // 1. جلب صفحة الفيديو من يوتيوب مع إرسال وكيل مستخدم (User-Agent) حديث لتبدو كطلب طبيعي
-        const ytRes = await axios.get(`https://www.youtube.com/watch?v=${videoId}`, {
-            headers: { 
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept-Language': 'ar,en-US;q=0.9,en;q=0.8'
-            }
-        });
-        const html = ytRes.data;
-
-        // 2. استخراج عنوان الفيديو
-        let title = null;
-        const tm = html.match(/<title>(.+?)<\/title>/);
-        if (tm) title = tm[1].replace(' - YouTube', '').trim();
-
-        // 3. استخراج مسارات الترجمة (Caption Tracks)
-        const tm2 = html.match(/"captionTracks":(\[[\s\S]*?\])/);
-        if (!tm2) {
-            return res.status(440).json({ error: 'لا توجد ترجمة متاحة لهذا الفيديو علنياً.\nتأكد أن الفيديو يحتوي على ترجمة يدوية أو تلقائية.' });
-        }
-
-        const tracks = JSON.parse(tm2[1]);
-        if (!tracks || tracks.length === 0) {
-            return res.status(440).json({ error: 'لا توجد ترجمة لهذا الفيديو.' });
-        }
-
-        // تحديد أفضل ترجمة متوفرة (العربية أولاً، ثم الإنجليزية، ثم أول خيار متاح)
-        const track = tracks.find(t => t.languageCode === 'ar') ||
-                      tracks.find(t => t.languageCode && t.languageCode.startsWith('ar')) ||
-                      tracks.find(t => t.languageCode === 'en') ||
-                      tracks[0];
-
-        // 4. جلب ملف الترجمة الفعلي (XML) من رابط يوتيوب المباشر
-        const xmlRes = await axios.get(track.baseUrl);
-        const xml = xmlRes.data;
-
-        // 5. معالجة الـ XML واستخراج النصوص البرمجية وتنظيفها
-        let raw = '';
-        const regex = /<text[^>]*>([\s\S]*?)<\/text>/g;
-        let match;
-        while ((match = regex.exec(xml)) !== null) {
-            let t = match[1]
-                .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
-                .replace(/&#39;/g, "'").replace(/&quot;/g, '"')
-                .replace(/<[^>]+>/g, '').replace(/\[.*?\]/g, '').trim();
-            if (t) raw += t + ' ';
-        }
-
-        if (!raw.trim()) {
-            return res.status(440).json({ error: 'ملف الترجمة موجود ولكنه فارغ.' });
-        }
-
-        // إرجاع النتيجة النهائية متوافقة تماماً مع ما يتوقعه موقعك
-        res.json({
-            raw: raw.trim(),
-            title,
-            lang: track.languageCode || 'und',
-            langName: track.name?.simpleText || track.languageCode || '?'
-        });
-
-    } catch (error) {
-        console.error(error);
-        res.status(500).json({ error: 'تعذّر الاتصال بيوتيوب عبر السيرفر الخارجي. يرجى المحاولة لاحقاً.' });
-    }
+    res.status(500).json({
+      error: `تعذّر استخراج الترجمة: ${msg}`
+    });
+  }
 });
 
-// تشغيل السيرفر على المنفذ الموفر من Railway تلقائياً
+// ─── Health check ───
+app.get('/health', (req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
+
+// ─── تشغيل السيرفر ───
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
