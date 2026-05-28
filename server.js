@@ -1,7 +1,5 @@
 const express = require('express');
 const cors = require('cors');
-const fs = require('fs');
-const path = require('path');
 
 const app = express();
 
@@ -9,41 +7,10 @@ const app = express();
 app.use(cors({
   origin: '*', // السماح لأي موقع بالاتصال بالسيرفر
   methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
+  allowedHeaders: ['Content-Type', 'Authorization', 'user-token'] // أضفنا الهيدر الجديد هنا
 }));
 
-// ─── دالة قراءة وتحويل كوكيز Netscape إلى صيغة نصية يفهمها الـ Header ───
-function loadCookies() {
-  const cookiesPath = path.resolve(__dirname, 'cookies.txt');
-  if (!fs.existsSync(cookiesPath)) {
-    console.warn("[⚠️ WARNING] ملف cookies.txt غير موجود في المسار:", cookiesPath);
-    return '';
-  }
-
-  try {
-    const content = fs.readFileSync(cookiesPath, 'utf8');
-    const lines = content.split('\n');
-    const cookiePairs = [];
-
-    for (let line of lines) {
-      line = line.trim();
-      if (!line || line.startsWith('#')) continue;
-      const parts = line.split('\t');
-      if (parts.length >= 7) {
-        const name = parts[5];
-        const value = parts[6];
-        cookiePairs.push(`${name}=${value}`);
-      }
-    }
-    console.log(`[INFO] تم تحميل (${cookiePairs.length}) كوكيز بنجاح لتخطي القيود.`);
-    return cookiePairs.join('; ');
-  } catch (error) {
-    console.error("[❌ ERROR] فشل في قراءة ملف الكوكيز:", error.message);
-    return '';
-  }
-}
-
-// ─── استخراج JSON من HTML بعد بالعد اليدوي للأقواس (أثبت من regex) ───
+// ─── استخراج JSON من HTML بالعد اليدوي للأقواس (أثبت من regex) ───
 function extractJSONObject(html, key) {
   const marker = `"${key}"`;
   let idx = html.indexOf(marker);
@@ -96,17 +63,15 @@ function extractVideoId(input) {
   return input.length === 11 ? input : null;
 }
 
-// ─── جلب الترجمة ───
-async function fetchTranscript(videoId) {
-  // تحميل الكوكيز ديناميكياً لتمريرها مع الطلب
-  const cookieString = loadCookies();
-
+// ─── جلب الترجمة بالاعتماد على توكن المستخدم ───
+async function fetchTranscript(videoId, userToken) {
   const headers = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
     'Accept-Language': 'ar,en-US;q=0.9,en;q=0.8',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
     'Accept-Encoding': 'gzip, deflate, br',
-    ...(cookieString ? { 'Cookie': cookieString } : {}) // إضافة الكوكيز فقط إذا كانت موجودة
+    // إذا قام المستخدم بتسجيل الدخول وأرسل التوكن، نمرره ليوتيوب فوراً لفك القيود
+    ...(userToken ? { 'Authorization': `Bearer ${userToken}` } : {})
   };
 
   const pageRes = await fetch(`https://www.youtube.com/watch?v=${videoId}`, { headers });
@@ -146,9 +111,8 @@ async function fetchTranscript(videoId) {
   }
 
   if (!playerData) {
-    // تحقق إن الفيديو موجود أصلاً
     if (html.includes('"playabilityStatus"')) {
-      throw new Error('تعذر قراءة بيانات الفيديو — قد يكون خاصاً أو محظوراً في منطقتك.');
+      throw new Error('تعذر قراءة بيانات الفيديو — قد يتطلب الفيديو تسجيل الدخول عبر حساب Google بموقعنا أولاً.');
     }
     throw new Error('تعذر استخراج بيانات الفيديو من يوتيوب. جرب مرة أخرى.');
   }
@@ -156,10 +120,9 @@ async function fetchTranscript(videoId) {
   // استخراج مسارات الترجمة
   const captions = playerData?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
   if (!captions || captions.length === 0) {
-    // هل الفيديو ممتاز أو مقيّد؟
     const status = playerData?.playabilityStatus?.status;
     if (status === 'LOGIN_REQUIRED' || status === 'UNPLAYABLE') {
-      throw new Error('هذا الفيديو مقيّد أو يتطلب تسجيل دخول ولا يمكن استخراج ترجمته آلياً.');
+      throw new Error('هذا الفيديو مقيّد! يرجى تسجيل الدخول بحساب Google من الزر أعلى الموقع لتخطي الحظر.');
     }
     throw new Error('لا توجد ترجمة متاحة لهذا الفيديو.\nتأكد أن الفيديو يحتوي على ترجمة يدوية أو تلقائية.');
   }
@@ -178,7 +141,7 @@ async function fetchTranscript(videoId) {
   if (!xmlRes.ok) throw new Error('فشل تحميل ملف الترجمة من يوتيوب.');
   const xml = await xmlRes.text();
 
-  // استخراج النصوص
+  // استخراج النصوص وتفريغها
   let raw = '';
   const regex = /<text[^>]*>([\s\S]*?)<\/text>/g;
   let match;
@@ -203,16 +166,18 @@ async function fetchTranscript(videoId) {
 // ─── Routes ───
 app.get('/api/transcript', async (req, res) => {
   const input = req.query.v;
+  const userToken = req.headers['user-token']; // استلام توكن الزائر من واجهة الموقع هنا
+
   if (!input) return res.status(400).json({ error: 'معرّف الفيديو مطلوب.' });
 
   const videoId = extractVideoId(input) || input;
 
   try {
-    const data = await fetchTranscript(videoId);
+    const data = await fetchTranscript(videoId, userToken);
     res.json(data);
   } catch (err) {
     console.error('[Error]', videoId, err.message);
-    const status = err.message.includes('لا توجد ترجمة') ? 404 : (err.message.includes('مقيّد') || err.message.includes('تسجيل دخول') ? 403 : 500);
+    const status = err.message.includes('لا توجد ترجمة') ? 404 : (err.message.includes('مقيّد') || err.message.includes('تسجيل') ? 403 : 500);
     res.status(status).json({ error: err.message });
   }
 });
@@ -220,4 +185,4 @@ app.get('/api/transcript', async (req, res) => {
 app.get('/health', (_req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`✅ Server on port ${PORT}`));
+app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
