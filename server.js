@@ -2,7 +2,13 @@ const express = require('express');
 const cors = require('cors');
 
 const app = express();
-app.use(cors());
+
+// ─── إعداد الـ CORS الشامل للسماح بالاتصال من موقعك ───
+app.use(cors({
+  origin: '*', // السماح لأي موقع بالاتصال بالسيرفر
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
 
 // ─── استخراج JSON من HTML بعد بالعد اليدوي للأقواس (أثبت من regex) ───
 function extractJSONObject(html, key) {
