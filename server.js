@@ -1,6 +1,6 @@
 const express = require('express');
 const cors    = require('cors');
-const { YoutubeTranscript } = require('youtube-transcript');
+const https   = require('https');
 
 const app = express();
 
@@ -22,21 +22,7 @@ function extractVideoId(input) {
     const m = input.match(p);
     if (m) return m[1];
   }
-  return input.length === 11 ? input : null;
-}
-
-// ─── جلب عنوان الفيديو ───
-async function fetchTitle(videoId) {
-  try {
-    const res  = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
-      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
-    });
-    const html = await res.text();
-    const m    = html.match(/<title>(.+?)<\/title>/);
-    return m ? m[1].replace(' - YouTube', '').trim() : videoId;
-  } catch {
-    return videoId;
-  }
+  return (input && input.length === 11) ? input : null;
 }
 
 // ─── تنظيف نص XML ───
@@ -52,7 +38,6 @@ function decodeXmlText(str) {
 function parseXML(xml) {
   let raw = '', match;
 
-  // صيغة ١: <text start="..." dur="...">نص</text>
   const r1 = /<text[^>]*>([\s\S]*?)<\/text>/g;
   while ((match = r1.exec(xml)) !== null) {
     const t = decodeXmlText(match[1]);
@@ -60,8 +45,6 @@ function parseXML(xml) {
   }
   if (raw.trim()) return raw.trim();
 
-  // صيغة ٢: <p t="...">نص</p>
-  console.log('[INFO] جرب صيغة <p>...');
   const r2 = /<p[^>]*>([\s\S]*?)<\/p>/g;
   while ((match = r2.exec(xml)) !== null) {
     const t = decodeXmlText(match[1]);
@@ -69,7 +52,6 @@ function parseXML(xml) {
   }
   if (raw.trim()) return raw.trim();
 
-  // صيغة ٣: JSON3
   try {
     const j = JSON.parse(xml);
     if (j.events) {
@@ -84,20 +66,79 @@ function parseXML(xml) {
   return '';
 }
 
-// ─── Fallback: HTML scraping ───
+// ─── Method 1: InnerTube API (بدون مكتبات خارجية) ───
+async function fetchViaInnerTube(videoId) {
+  console.log('[INFO] Method 1: InnerTube API...');
+
+  // جلب player page للحصول على transcript list
+  const playerRes = await fetch('https://www.youtube.com/youtubei/v1/get_transcript?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Origin': 'https://www.youtube.com',
+      'Referer': `https://www.youtube.com/watch?v=${videoId}`,
+      'X-YouTube-Client-Name': '1',
+      'X-YouTube-Client-Version': '2.20240101.00.00',
+    },
+    body: JSON.stringify({
+      context: {
+        client: {
+          clientName: 'WEB',
+          clientVersion: '2.20240101.00.00',
+          hl: 'en',
+          gl: 'US',
+        }
+      },
+      videoId,
+      params: btoa(`\n\x0b${videoId}`)
+    })
+  });
+
+  if (!playerRes.ok) throw new Error(`InnerTube HTTP ${playerRes.status}`);
+  const data = await playerRes.json();
+
+  // استخراج النصوص من الرد
+  const actions = data?.actions?.[0]?.updateEngagementPanelAction?.content
+    ?.transcriptRenderer?.content?.transcriptSearchPanelRenderer
+    ?.body?.transcriptSegmentListRenderer?.initialSegments;
+
+  if (!actions || !actions.length) throw new Error('InnerTube: لا توجد بيانات ترجمة');
+
+  const raw = actions
+    .map(seg => seg?.transcriptSegmentRenderer?.snippet?.runs?.[0]?.text || '')
+    .filter(t => t.trim())
+    .join(' ')
+    .trim();
+
+  if (!raw) throw new Error('InnerTube: النص فارغ');
+  return raw;
+}
+
+// ─── Method 2: HTML scraping ───
 async function fetchViaHTML(videoId) {
+  console.log('[INFO] Method 2: HTML scraping...');
+
   const headers = {
     'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
     'Accept-Language': 'en-US,en;q=0.9',
     'Accept':          'text/html,application/xhtml+xml',
+    'Cookie':          'CONSENT=YES+cb; PREF=hl=en&gl=US',
   };
 
-  const pageRes = await fetch(`https://www.youtube.com/watch?v=${videoId}`, { headers });
+  const pageRes = await fetch(`https://www.youtube.com/watch?v=${videoId}&hl=en`, { headers });
   if (!pageRes.ok) throw new Error(`YouTube HTTP ${pageRes.status}`);
-  const html    = await pageRes.text();
+  const html = await pageRes.text();
 
+  // استخراج captionTracks
   const capMatch = html.match(/"captionTracks":(\[.*?\])/);
-  if (!capMatch) throw new Error('لا توجد ترجمة متاحة لهذا الفيديو.');
+  if (!capMatch) {
+    // تحقق هل الفيديو موجود أصلاً
+    if (html.includes('"playabilityStatus":{"status":"ERROR"')) throw new Error('الفيديو غير موجود أو محذوف.');
+    if (html.includes('LOGIN_REQUIRED')) throw new Error('هذا الفيديو يتطلب تسجيل دخول على يوتيوب.');
+    throw new Error('لا توجد ترجمة متاحة لهذا الفيديو.');
+  }
 
   let captions;
   try { captions = JSON.parse(capMatch[1]); }
@@ -118,45 +159,79 @@ async function fetchViaHTML(videoId) {
 
   const xmlRes = await fetch(track.baseUrl, { headers });
   if (!xmlRes.ok) throw new Error(`فشل تحميل الترجمة HTTP ${xmlRes.status}`);
-  const xml    = await xmlRes.text();
-  console.log(`[INFO] حجم XML: ${xml.length} — أول 200 حرف: ${xml.slice(0, 200)}`);
+  const xml = await xmlRes.text();
+  console.log(`[INFO] حجم XML: ${xml.length} حرف — أول 150: ${xml.slice(0, 150)}`);
 
   const raw = parseXML(xml);
-  if (!raw) throw new Error('تعذّر قراءة محتوى الترجمة. جرب فيديو آخر.');
+  if (!raw) throw new Error('تعذّر قراءة محتوى الترجمة.');
 
   return { raw, lang: track.languageCode || 'und', langName: track.name?.simpleText || '؟' };
 }
 
-// ─── الدالة الرئيسية ───
+// ─── Method 3: youtube-transcript package ───
+async function fetchViaPackage(videoId) {
+  console.log('[INFO] Method 3: youtube-transcript package...');
+  const { YoutubeTranscript } = require('youtube-transcript');
+  const list = await YoutubeTranscript.fetchTranscript(videoId);
+  if (!list || !list.length) throw new Error('Package: قائمة فارغة');
+  const raw = list
+    .map(item => item.text.replace(/\[.*?\]/g, '').trim())
+    .filter(t => t)
+    .join(' ')
+    .trim();
+  if (!raw) throw new Error('Package: النص فارغ');
+  return { raw, lang: 'und', langName: '؟' };
+}
+
+// ─── جلب العنوان ───
+async function fetchTitle(videoId) {
+  try {
+    const res  = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
+      headers: { 'User-Agent': 'Mozilla/5.0', 'Accept-Language': 'en-US,en;q=0.9' }
+    });
+    const html = await res.text();
+    const m    = html.match(/<title>(.+?)<\/title>/);
+    return m ? m[1].replace(' - YouTube', '').trim() : videoId;
+  } catch { return videoId; }
+}
+
+// ─── الدالة الرئيسية — 3 محاولات ───
 async function fetchTranscript(videoId) {
   const title = await fetchTitle(videoId);
+  const errors = [];
 
-  // ── المحاولة الأولى: youtube-transcript package ──
+  // Method 3 أولاً (الأكثر استقراراً مع IPs الـ datacenter)
   try {
-    console.log('[INFO] Method 1: youtube-transcript package...');
-    const list = await YoutubeTranscript.fetchTranscript(videoId);
-
-    if (list && list.length > 0) {
-      const raw = list
-        .map(item => item.text.replace(/\[.*?\]/g, '').trim())
-        .filter(t => t)
-        .join(' ')
-        .trim();
-
-      if (raw) {
-        console.log(`[OK] Method 1 نجح — ${raw.split(' ').length} كلمة`);
-        return { raw, title, lang: 'und', langName: '؟' };
-      }
-    }
-  } catch (e) {
-    console.warn('[WARN] Method 1 فشل:', e.message);
+    const result = await fetchViaPackage(videoId);
+    return { ...result, title };
+  } catch(e) {
+    console.warn('[WARN] Method 3 فشل:', e.message);
+    errors.push('Package: ' + e.message);
   }
 
-  // ── المحاولة الثانية: HTML scraping ──
-  console.log('[INFO] Method 2: HTML scraping...');
-  const { raw, lang, langName } = await fetchViaHTML(videoId);
-  console.log(`[OK] Method 2 نجح — ${raw.split(' ').length} كلمة`);
-  return { raw, title, lang, langName };
+  // Method 2
+  try {
+    const result = await fetchViaHTML(videoId);
+    return { ...result, title };
+  } catch(e) {
+    console.warn('[WARN] Method 2 فشل:', e.message);
+    errors.push('HTML: ' + e.message);
+    // إذا الخطأ واضح — لا داعي للمحاولة الثالثة
+    if (e.message.includes('لا توجد ترجمة') || e.message.includes('LOGIN_REQUIRED') || e.message.includes('غير موجود')) {
+      throw e;
+    }
+  }
+
+  // Method 1 أخيراً
+  try {
+    const raw = await fetchViaInnerTube(videoId);
+    return { raw, title, lang: 'und', langName: '؟' };
+  } catch(e) {
+    console.warn('[WARN] Method 1 فشل:', e.message);
+    errors.push('InnerTube: ' + e.message);
+  }
+
+  throw new Error('فشلت جميع طرق الاستخراج:\n' + errors.join('\n'));
 }
 
 // ─── Routes ───
@@ -164,19 +239,21 @@ app.get('/api/transcript', async (req, res) => {
   const input = req.query.v;
   if (!input) return res.status(400).json({ error: 'معرّف الفيديو مطلوب.' });
 
-  const videoId = extractVideoId(input) || input;
-  console.log(`\n[REQ] === ${videoId} ===`);
+  const videoId = extractVideoId(input) || input.slice(0, 11);
+  console.log(`\n[REQ] ===== ${videoId} =====`);
 
   try {
     const data = await fetchTranscript(videoId);
-    console.log(`[OK] الإجمالي: ${data.raw.split(' ').length} كلمة`);
+    console.log(`[OK] ✅ ${data.raw.split(' ').length} كلمة — ${data.lang}`);
     res.json(data);
   } catch (err) {
-    console.error(`[ERR] ${err.message}`);
-    const status = err.message.includes('لا توجد ترجمة') ? 404
-                 : err.message.includes('مقيّد')          ? 403
+    console.error(`[ERR] ❌ ${err.message}`);
+    const msg    = err.message || '';
+    const status = (msg.includes('لا توجد ترجمة') || msg.includes('لا توجد بيانات')) ? 404
+                 : msg.includes('LOGIN_REQUIRED')  ? 403
+                 : msg.includes('غير موجود')        ? 404
                  : 500;
-    res.status(status).json({ error: err.message });
+    res.status(status).json({ error: msg.split('\n')[0] });
   }
 });
 
