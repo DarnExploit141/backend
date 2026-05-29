@@ -43,9 +43,10 @@ app.use((req, res, next) => {
 // use it as a proxy to YouTube, burning Railway bandwidth.
 // Change to explicit list. Add your production domain here.
 const ALLOWED_ORIGINS = [
-  'https://nassas1.vercel.app',   // primary frontend (adjust to real domain)
-  'http://localhost:3000',         // local dev
-  'http://localhost:5500',         // VS Code Live Server
+  'https://darnexploit141.github.io',
+  'https://nassas1.vercel.app',
+  'http://localhost:3000',
+  'http://localhost:5500',
   'http://127.0.0.1:5500',
 ];
 
