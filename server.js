@@ -25,7 +25,7 @@ function extractVideoId(input) {
   return input.length === 11 ? input : null;
 }
 
-// ─── جلب عنوان الفيديو فقط ───
+// ─── جلب عنوان الفيديو ───
 async function fetchTitle(videoId) {
   try {
     const res  = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
@@ -39,7 +39,7 @@ async function fetchTitle(videoId) {
   }
 }
 
-// ─── تنظيف نص XML (للـ fallback) ───
+// ─── تنظيف نص XML ───
 function decodeXmlText(str) {
   return str
     .replace(/&amp;/g,  '&').replace(/&lt;/g,  '<').replace(/&gt;/g,  '>')
@@ -48,7 +48,7 @@ function decodeXmlText(str) {
     .replace(/<[^>]+>/g, '').replace(/\[.*?\]/g, '').replace(/\s+/g, ' ').trim();
 }
 
-// ─── تحليل XML (للـ fallback) ───
+// ─── تحليل XML ───
 function parseXML(xml) {
   let raw = '', match;
 
@@ -84,7 +84,7 @@ function parseXML(xml) {
   return '';
 }
 
-// ─── Fallback يدوي: HTML scraping ───
+// ─── Fallback: HTML scraping ───
 async function fetchViaHTML(videoId) {
   const headers = {
     'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
@@ -96,7 +96,6 @@ async function fetchViaHTML(videoId) {
   if (!pageRes.ok) throw new Error(`YouTube HTTP ${pageRes.status}`);
   const html    = await pageRes.text();
 
-  // استخراج captionTracks من الصفحة
   const capMatch = html.match(/"captionTracks":(\[.*?\])/);
   if (!capMatch) throw new Error('لا توجد ترجمة متاحة لهذا الفيديو.');
 
@@ -117,7 +116,6 @@ async function fetchViaHTML(videoId) {
 
   console.log(`[INFO] مسار مختار: ${track.languageCode} kind=${track.kind || 'manual'}`);
 
-  // جلب XML
   const xmlRes = await fetch(track.baseUrl, { headers });
   if (!xmlRes.ok) throw new Error(`فشل تحميل الترجمة HTTP ${xmlRes.status}`);
   const xml    = await xmlRes.text();
@@ -134,7 +132,6 @@ async function fetchTranscript(videoId) {
   const title = await fetchTitle(videoId);
 
   // ── المحاولة الأولى: youtube-transcript package ──
-  // أسرع وأكثر استقراراً من HTML scraping
   try {
     console.log('[INFO] Method 1: youtube-transcript package...');
     const list = await YoutubeTranscript.fetchTranscript(videoId);
@@ -155,7 +152,7 @@ async function fetchTranscript(videoId) {
     console.warn('[WARN] Method 1 فشل:', e.message);
   }
 
-  // ── المحاولة الثانية: HTML scraping يدوي ──
+  // ── المحاولة الثانية: HTML scraping ──
   console.log('[INFO] Method 2: HTML scraping...');
   const { raw, lang, langName } = await fetchViaHTML(videoId);
   console.log(`[OK] Method 2 نجح — ${raw.split(' ').length} كلمة`);
